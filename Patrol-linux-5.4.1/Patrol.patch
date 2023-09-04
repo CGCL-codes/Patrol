@@ -1,0 +1,580 @@
+From e0f4b95e3086790cdaa72cd073bc5b1a86d45e79 Mon Sep 17 00:00:00 2001
+From: lizhi16 <791873122@qq.com>
+Date: Thu, 13 Jul 2023 23:51:23 -0700
+Subject: [PATCH] Patrol
+
+---
+ fs/dcache.c                   |  13 ++
+ fs/namei.c                    | 109 ++++++++++++++
+ fs/namespace.c                | 276 ++++++++++++++++++++++++++++++++++
+ include/linux/dcache.h        |   5 +
+ include/linux/pid_namespace.h |  14 ++
+ kernel/pid_namespace.c        |   3 +
+ 6 files changed, 420 insertions(+)
+
+diff --git a/fs/dcache.c b/fs/dcache.c
+index e88cf0554..423819479 100644
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@ -1731,6 +1731,10 @@ struct dentry *__d_alloc(struct super_block *sb, const struct qstr *name)
+ 	dentry->d_sb = sb;
+ 	dentry->d_op = NULL;
+ 	dentry->d_fsdata = NULL;
++	
++	// [Patrol]: init the tag with the creator's pid_ns
++	dentry->d_pid_ns = current->nsproxy->pid_ns_for_children;
++
+ 	INIT_HLIST_BL_NODE(&dentry->d_hash);
+ 	INIT_LIST_HEAD(&dentry->d_lru);
+ 	INIT_LIST_HEAD(&dentry->d_subdirs);
+@@ -1774,6 +1778,10 @@ struct dentry *d_alloc(struct dentry * parent, const struct qstr *name)
+ 	 */
+ 	__dget_dlock(parent);
+ 	dentry->d_parent = parent;
++	
++	// [Patrol]: inherit namespace tag from the parent
++	dentry->d_pid_ns = parent->d_pid_ns;
++	
+ 	list_add(&dentry->d_child, &parent->d_subdirs);
+ 	spin_unlock(&parent->d_lock);
+ 
+@@ -1793,6 +1801,11 @@ struct dentry *d_alloc_cursor(struct dentry * parent)
+ 	if (dentry) {
+ 		dentry->d_flags |= DCACHE_DENTRY_CURSOR;
+ 		dentry->d_parent = dget(parent);
++
++		//lizhi
++		// dentry->d_pid_ns = parent->d_pid_ns;
++		// if (parent->d_pid_ns != NULL && parent->d_pid_ns->security_level != 0)
++		// 	printk("[TEST-new] d_alloc_cursor: %s - %s[%p][%d]\n", current->comm, dentry->d_name.name, dentry, parent->d_pid_ns->security_level);
+ 	}
+ 	return dentry;
+ }
+diff --git a/fs/namei.c b/fs/namei.c
+index 671c3c1a3..9ec1cd432 100644
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -506,6 +506,15 @@ struct nameidata {
+ 	struct inode	*link_inode;
+ 	unsigned	root_seq;
+ 	int		dfd;
++
++	/*
++	 * [Patrol]: 
++	 * 'open_flag' store the open flag into the nameidata
++	 * 'pid_ns' is used to be a security_level tag
++	*/
++	int open_flags;
++	struct pid_namespace *pid_ns;
++
+ } __randomize_layout;
+ 
+ static void set_nameidata(struct nameidata *p, int dfd, struct filename *name)
+@@ -516,6 +525,11 @@ static void set_nameidata(struct nameidata *p, int dfd, struct filename *name)
+ 	p->name = name;
+ 	p->total_link_count = old ? old->total_link_count : 0;
+ 	p->saved = old;
++
++	// [Patrol]: init open_flag and security_level tag
++	p->open_flags = 0;
++	p->pid_ns = current->nsproxy->pid_ns_for_children;
++
+ 	current->nameidata = p;
+ }
+ 
+@@ -760,6 +774,17 @@ static inline int d_revalidate(struct dentry *dentry, unsigned int flags)
+ 		return 1;
+ }
+ 
++/**
++ * [Patrol] for checking if the pid_ns pointer is valid
++ */
++bool valide_ns(struct pid_namespace *pid_ns)
++{
++	if (pid_ns == NULL || pid_ns == ERR_PTR(-EINVAL))
++		return false;
++	else
++		return true;
++}
++
+ /**
+  * complete_walk - successful completion of path walk
+  * @nd:  pointer nameidata
+@@ -775,6 +800,34 @@ static int complete_walk(struct nameidata *nd)
+ 	struct dentry *dentry = nd->path.dentry;
+ 	int status;
+ 
++	/**
++	 * [Patrol]: enforce the access control policies (P1 and P2)
++	 * P1: constraining object-access results
++	 * P2: constraining control-transfer behaviors
++	 */
++	if (valide_ns(nd->pid_ns) && valide_ns(dentry->d_pid_ns)){
++		int pc_sl = current->nsproxy->pid_ns_for_children->security_level;
++		int nd_sl = nd->pid_ns->security_level;
++		int dt_sl = dentry->d_pid_ns->security_level;
++		
++		// Based on the P1 & P2 to check if the access is legal
++		// if the access is illegal, return error "operation not permitted"
++		if (pc_sl > dt_sl && (nd->open_flags & __FMODE_EXEC)) {
++			printk(KERN_DEBUG "[WARN][Patrol]: Host Process executes the container's executable.\n");
++			return -EPERM;
++		} 
++		else if (pc_sl > nd_sl && dt_sl > nd_sl) {
++			printk(KERN_DEBUG "[WARN][Patrol]: Host process steps into untrusted environemnt and steps out.\n");
++			return -EPERM;
++		} 
++		else if (pc_sl < dt_sl) {
++			if (dt_sl != -1 && !S_ISFIFO(dentry->d_inode->i_mode)) {
++				printk(KERN_DEBUG "[WARN][Patrol]: Container process accesses the host file.\n");
++				return -EPERM;
++			}
++		}
++	} 
++
+ 	if (nd->flags & LOOKUP_RCU) {
+ 		if (!(nd->flags & LOOKUP_ROOT))
+ 			nd->root.mnt = NULL;
+@@ -831,6 +884,23 @@ static inline void path_to_nameidata(const struct path *path,
+ 		if (nd->path.mnt != path->mnt)
+ 			mntput(nd->path.mnt);
+ 	}
++
++	/* 
++	 * [Patrol] implement the dynamic rendering:
++	 * update the security level (sl) in the path lookup
++	 * compare the current sl in nameidat and the dentry's sl
++	 */
++	if (valide_ns(path->dentry->d_pid_ns) && valide_ns(nd->pid_ns)) {			
++		if (nd->pid_ns != path->dentry->d_pid_ns) {
++			int nd_sl = nd->pid_ns->security_level;
++			int dt_sl = path->dentry->d_pid_ns->security_level;
++
++			// update the tag in nameidata
++			if (nd_sl >= dt_sl)
++				nd->pid_ns = path->dentry->d_pid_ns;
++		}
++	} 
++
+ 	nd->path.mnt = path->mnt;
+ 	nd->path.dentry = path->dentry;
+ }
+@@ -2248,6 +2318,40 @@ static const char *trailing_symlink(struct nameidata *nd)
+ 	int error = may_follow_link(nd);
+ 	if (unlikely(error))
+ 		return ERR_PTR(error);
++
++	/*
++	 * [Patrol]:
++	 * Fix starting point for symlink parsing
++	 */
++	if(valide_ns(nd->path.dentry->d_pid_ns)) {
++		int dentry_sl;
++		struct pid_namespace *real_ns;
++		
++		real_ns = NULL;
++		dentry_sl = nd->path.dentry->d_pid_ns->security_level;
++
++		// determine the real root of the symlink
++		if (valide_ns(nd->pid_ns)) {
++			if (nd->pid_ns->security_level < dentry_sl) {
++				real_ns = nd->pid_ns;
++			}
++			else {	// update the security level based on the current symlink dentry
++				nd->pid_ns = nd->path.dentry->d_pid_ns;
++				real_ns = nd->pid_ns;
++			}
++		}
++		else if (dentry_sl < 0) {
++			real_ns = nd->path.dentry->d_pid_ns;
++		}
++
++		// set real root
++		if (real_ns != NULL) {
++			nd->root.dentry = real_ns->root_path.dentry;
++			nd->root.mnt = real_ns->root_path.mnt;
++			path_get(&nd->root);
++		}
++	}
++
+ 	nd->flags |= LOOKUP_PARENT;
+ 	nd->stack[0].name = NULL;
+ 	s = get_link(nd);
+@@ -3552,6 +3656,11 @@ struct file *do_filp_open(int dfd, struct filename *pathname,
+ 	struct file *filp;
+ 
+ 	set_nameidata(&nd, dfd, pathname);
++
++	// [Patrol]: init nameidata
++    nd.open_flags = op->open_flag;
++    nd.pid_ns = current->nsproxy->pid_ns_for_children;
++
+ 	filp = path_openat(&nd, op, flags | LOOKUP_RCU);
+ 	if (unlikely(filp == ERR_PTR(-ECHILD)))
+ 		filp = path_openat(&nd, op, flags);
+diff --git a/fs/namespace.c b/fs/namespace.c
+index 2adfe7b16..49b6bed5a 100644
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@ -2314,6 +2314,7 @@ static int do_loopback(struct path *path, const char *old_name,
+ 	unlock_mount(mp);
+ out:
+ 	path_put(&old_path);
++
+ 	return err;
+ }
+ 
+@@ -3588,6 +3589,249 @@ bool path_is_under(const struct path *path1, const struct path *path2)
+ }
+ EXPORT_SYMBOL(path_is_under);
+ 
++/*
++ * [Patrol]:
++ * 'rendering_dentry_tree' works for initial VFS rendering after a container is created.
++ * The rendering begins with the dentry of the rootfs's root,
++ * and uses the pid_ns to tag the dentry structure.
++ * if it meets a mountpoint,
++ * it calls this function recursively to render the dentries of the mounted fs.
++ *
++ * 'alloc_security_tag' works for allocating a pid_namespace structure to be a tag.
++ * This pid namespace is non-functional, being the tag to identify the security level.
++ *
++ * 'clear_rendering' is called after the rendering failed.
++ * It clears all dentries' security level information in the tags.
++ */
++
++#define RENDER_SUCCESS	0
++#define RENDER_FAILED	1
++#define ILLEGAL_PARAS	2
++
++#define	MNT_RENDER_PASS	(MNT_NOSUID | MNT_NODEV | MNT_NOEXEC)
++#define	DCACHE_SHARED	(DCACHE_OP_REAL | DCACHE_DIRECTORY_TYPE | DCACHE_REFERENCED)
++
++struct pid_namespace *alloc_security_tag(int security_level, struct mount *mounted)
++{
++	struct pid_namespace *tmp_pid_ns;
++	
++	tmp_pid_ns = kzalloc(sizeof(struct pid_namespace), GFP_KERNEL);
++	if (!tmp_pid_ns) {
++		printk(KERN_ERR "[Patrol] %s: Not enough memory to alloc security tag.\n", __func__);
++		return NULL;
++	}
++	
++	// NOTE: using 'switch' to avoid setting illegal security level
++	// set the tag of security level
++	switch (security_level)
++	{
++	case -2:		// STRICT
++		tmp_pid_ns->security_level = -2;
++		break;
++	case -1:		// SHARED
++		tmp_pid_ns->security_level = -1;
++		break;
++	case 0:			// NORMAL
++		tmp_pid_ns->security_level = 0;
++		break;
++	default:
++		kfree(tmp_pid_ns);
++		return NULL;
++	}
++
++	// Store the real root of the new security level instance
++	if (mounted != NULL) {
++		tmp_pid_ns->root_path.dentry = mounted->mnt.mnt_root;
++		tmp_pid_ns->root_path.mnt = &mounted->mnt;
++		path_get(&tmp_pid_ns->root_path);
++	} 
++	else {
++		printk(KERN_WARNING "[Patrol] %s: root path setting failed.\n", __func__);
++		
++		kfree(tmp_pid_ns);
++		return NULL;
++	}
++	
++	return tmp_pid_ns;
++}
++
++int rendering_dentry_tree(struct dentry *root, struct vfsmount *root_mnt, struct pid_namespace *pid_ns, struct dentry *hroot)
++{
++	struct dentry *this_parent;
++	struct list_head *next;
++
++	if (root == NULL || root_mnt == NULL) {
++		printk(KERN_WARNING "[Patrol] %s: root parameters are illegal.\n", __func__);
++		return -ILLEGAL_PARAS;
++	}
++
++	this_parent = root;
++	this_parent->d_pid_ns = pid_ns;
++
++	// judge if the dentry is a mountpoint
++	if (d_mountpoint(root)){
++		int rd_err = 0;
++		struct mount *mounted;
++
++		// get the mount information of the mounted fs
++		mounted = __lookup_mnt(root_mnt, root);
++		if (!mounted)
++			goto repeat;
++
++		// bypass the host's root
++		if (hroot == mounted->mnt.mnt_root){
++			mounted->mnt.mnt_root->d_pid_ns = NULL;
++			goto repeat;
++		}
++
++		rd_err = rendering_dentry_tree(mounted->mnt.mnt_root, &mounted->mnt, pid_ns, hroot);
++		if (rd_err < 0) 
++			return -RENDER_FAILED;
++	}
++
++repeat:
++	next = this_parent->d_subdirs.next;
++resume:
++	while (next != &this_parent->d_subdirs) {
++		struct list_head *tmp = next;
++		struct dentry *dentry = list_entry(tmp, struct dentry, d_child);
++		
++		next = tmp->next;
++		dentry->d_pid_ns = pid_ns;
++
++		if (unlikely(dentry->d_flags & DCACHE_DENTRY_CURSOR))
++			continue;
++
++		// handle the mountpoint and render the mounted fs
++		if (d_mountpoint(dentry)) {
++			int rd_err = 0;
++			struct pid_namespace *d_ns = pid_ns;
++			struct mount *mounted;
++
++			// find the mounted fs under this mountpoint
++			mounted = __lookup_mnt(root_mnt, dentry);
++			if (!mounted)
++				goto loop;
++
++			// judge if it is a bind mount by the flags
++			if ((mounted->mnt.mnt_flags & MNT_READONLY) == MNT_READONLY) {
++				d_ns = NULL;	// sysfs, cgroup
++			}
++			else if ((mounted->mnt.mnt_flags & MNT_RENDER_PASS) == MNT_RENDER_PASS) {
++				d_ns = NULL;	// procfs
++			}
++			else if ((dentry->d_flags & DCACHE_SHARED) == DCACHE_SHARED) {
++				// handle the multiple shared volumes
++				struct dentry *pd = dentry->d_parent;
++				if (pd->d_pid_ns != NULL && pd->d_pid_ns->security_level == -1) {
++					d_ns = pd->d_pid_ns;
++				}
++				else {
++					d_ns = alloc_security_tag(-1, mounted);
++					if (!d_ns) {
++						printk(KERN_WARNING "[Patrol] %s: alloc security tag failed.\n", __func__);
++						return -RENDER_FAILED;
++					}
++				}
++			}
++
++			rd_err = rendering_dentry_tree(mounted->mnt.mnt_root, &mounted->mnt, d_ns, hroot);
++			if (rd_err < 0) 
++				return -RENDER_FAILED;
++		}
++
++loop:
++		if (!list_empty(&dentry->d_subdirs)) {
++			this_parent = dentry;
++			goto repeat;
++		}
++	}
++
++ascend:
++	if (this_parent != root) {
++		struct dentry *child = this_parent;
++		this_parent = child->d_parent;
++
++		/* go into the first sibling still alive */
++		do {
++			next = child->d_child.next;
++			if (next == &this_parent->d_subdirs)
++				goto ascend;
++			child = list_entry(next, struct dentry, d_child);
++		} while (unlikely(child->d_flags & DCACHE_DENTRY_KILLED));
++		
++		goto resume;
++	}
++	
++	return RENDER_SUCCESS;
++}
++
++int clear_rendering(struct dentry *root, struct vfsmount *root_mnt)
++{
++	struct dentry *this_parent;
++	struct list_head *next;
++
++	if (root == NULL || root_mnt == NULL) {
++		printk(KERN_WARNING "[Patrol] %s: the root parameters are illegal.\n", __func__);
++		return -1;
++	}
++
++	// clear the dentry's tag
++	this_parent = root;
++	if (this_parent->d_pid_ns != NULL)
++		this_parent->d_pid_ns->security_level = 0;
++
++	// judge if the dentry is a mountpoint
++	if (d_mountpoint(root)){
++		int clean_err = 0;
++		struct mount *mounted;
++
++		// get the mount information of the mounted fs
++		mounted = __lookup_mnt(root_mnt, root);
++		if (!mounted)
++			goto repeat;
++
++		clean_err = clear_rendering(mounted->mnt.mnt_root, &mounted->mnt);
++		if (clean_err < 0)
++			goto repeat;
++	}
++
++repeat:
++	// walk the dentries of sub-directories
++	next = this_parent->d_subdirs.next;
++	while (next != &this_parent->d_subdirs) {
++		struct list_head *tmp = next;
++		struct dentry *dentry = list_entry(tmp, struct dentry, d_child);
++		
++		next = tmp->next;
++			
++		// clear the dentry's tag
++		if (dentry->d_pid_ns != NULL)
++			dentry->d_pid_ns->security_level = 0;
++
++		// handle the mountpoint and render the mounted fs
++		if (d_mountpoint(dentry)){
++			int clean_err = 0;
++			struct mount *mounted;
++
++			mounted = __lookup_mnt(root_mnt, dentry);
++			if (!mounted)
++				goto loop;
++
++			clean_err = clear_rendering(mounted->mnt.mnt_root, &mounted->mnt);
++			if (clean_err < 0)
++				goto loop;
++		}
++loop:
++		if (!list_empty(&dentry->d_subdirs)){
++			this_parent = dentry;
++			goto repeat;
++		}
++	}
++
++	return 0;
++}
++
+ /*
+  * pivot_root Semantics:
+  * Moves the root file system of the current process to the directory put_old,
+@@ -3696,6 +3940,38 @@ SYSCALL_DEFINE2(pivot_root, const char __user *, new_root,
+ 	list_del_init(&new_mnt->mnt_expire);
+ 	put_mountpoint(root_mp);
+ 	unlock_mount_hash();
++
++	/**
++	 * [Patrol]: reload the Pivot_root to init rendering for the container's rootfs
++	 */
++	if (current->nsproxy->mnt_ns != current->parent->nsproxy->mnt_ns && current->nsproxy->net_ns != current->parent->nsproxy->net_ns) {
++		int render_rtv;
++		struct pid_namespace *strict_ns;
++		struct dentry *hroot;
++
++		printk(KERN_INFO "[Patrol]: Strat to initial rendering\n");
++		
++		// get the host's root
++		hroot = current->fs->root.dentry;
++		
++		// set the security level to the tag (pid_namespace)
++		strict_ns = current->nsproxy->pid_ns_for_children;
++		strict_ns->security_level = -2;
++		new.dentry->d_pid_ns = strict_ns;
++		
++		// start to render
++		render_rtv = rendering_dentry_tree(new.dentry, new.mnt, strict_ns, hroot);
++		if (render_rtv < 0) {
++			printk(KERN_ERR "[Patrol]: Initial rendering failed, cleaning...\n");
++			clear_rendering(new.dentry, new.mnt);
++		}
++
++		// store the information of the container's rootfs
++		strict_ns->root_path.dentry = new.dentry;
++		strict_ns->root_path.mnt = new.mnt;
++		path_get(&strict_ns->root_path);
++	}
++
+ 	chroot_fs_refs(&root, &new);
+ 	error = 0;
+ out4:
+diff --git a/include/linux/dcache.h b/include/linux/dcache.h
+index 10090f11a..5d241fb2e 100644
+--- a/include/linux/dcache.h
++++ b/include/linux/dcache.h
+@@ -118,6 +118,11 @@ struct dentry {
+ 		struct hlist_bl_node d_in_lookup_hash;	/* only for in-lookup ones */
+ 	 	struct rcu_head d_rcu;
+ 	} d_u;
++	/*
++	 * [Patrol]:
++	 * d_pid_ns is a tag to indicate the namespace that the current dentry belong to
++	*/
++	struct pid_namespace *d_pid_ns;
+ } __randomize_layout;
+ 
+ /*
+diff --git a/include/linux/pid_namespace.h b/include/linux/pid_namespace.h
+index 49538b172..26e893a65 100644
+--- a/include/linux/pid_namespace.h
++++ b/include/linux/pid_namespace.h
+@@ -21,6 +21,13 @@ enum { /* definitions for pid_namespace's hide_pid field */
+ 	HIDEPID_INVISIBLE = 2,
+ };
+ 
++// [Patrol] enum define
++enum fs_security_level {
++	SL_STRICT = -2,
++	SL_SHARED = -1,
++	SL_NORMAL =  0,
++};
++
+ struct pid_namespace {
+ 	struct kref kref;
+ 	struct idr idr;
+@@ -45,6 +52,13 @@ struct pid_namespace {
+ 	int hide_pid;
+ 	int reboot;	/* group exit code if this pidns was rebooted */
+ 	struct ns_common ns;
++	/*
++	 * [Patrol]: 
++	 * security_level is the security level flag.
++	 * root_path stores the real root of each scope (e.g., container)
++	*/
++	enum fs_security_level security_level;
++	struct path root_path;
+ } __randomize_layout;
+ 
+ extern struct pid_namespace init_pid_ns;
+diff --git a/kernel/pid_namespace.c b/kernel/pid_namespace.c
+index a6a79f85c..eab53f35c 100644
+--- a/kernel/pid_namespace.c
++++ b/kernel/pid_namespace.c
+@@ -110,6 +110,9 @@ static struct pid_namespace *create_pid_namespace(struct user_namespace *user_ns
+ 		goto out_free_idr;
+ 	ns->ns.ops = &pidns_operations;
+ 
++	// [Patrol]: init security level tag
++	ns->security_level = 0;
++
+ 	kref_init(&ns->kref);
+ 	ns->level = level;
+ 	ns->parent = get_pid_ns(parent_pid_ns);
+-- 
+2.17.1
+
